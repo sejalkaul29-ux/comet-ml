@@ -1,5 +1,6 @@
 # mypy: disable-error-code=no-untyped-def
 
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -8,10 +9,14 @@ from gepa.utils.stop_condition import NoImprovementStopper, ScoreThresholdStoppe
 
 from opik_optimizer import GepaOptimizer, constants
 from opik_optimizer.algorithms.gepa_optimizer.gepa_optimizer import (
+    MIN_EXPECTED_REFLECTION_ITERATIONS,
     _build_gepa_stop_callbacks,
     _coerce_no_improvement_iterations,
     _coerce_positive_int,
+    _warn_if_reflection_minibatch_exhausts_budget,
 )
+
+_GEPA_OPTIMIZER_LOGGER = "opik_optimizer.algorithms.gepa_optimizer.gepa_optimizer"
 
 
 def _make_mock_gepa_result(**overrides: Any) -> MagicMock:
@@ -33,6 +38,7 @@ def _run_optimize(
     sample_metric,
     *,
     gepa_result: MagicMock | None = None,
+    on_gepa_optimize: Any = None,
     **optimize_kwargs: Any,
 ) -> tuple[Any, dict[str, Any]]:
     """Run optimize_prompt with gepa.optimize mocked; return (result, captured kwargs)."""
@@ -48,6 +54,8 @@ def _run_optimize(
 
     def fake_optimize(**kwargs: Any) -> MagicMock:
         captured.update(kwargs)
+        if on_gepa_optimize is not None:
+            on_gepa_optimize(kwargs)
         return gepa_result if gepa_result is not None else _make_mock_gepa_result()
 
     monkeypatch.setattr("gepa.optimize", fake_optimize)
@@ -209,6 +217,82 @@ class TestGepaFinishReason:
 
         assert result.details["finish_reason"] != "perfect_score"
 
+    def test_finish_reason__no_wired_stopper_fired__falls_back_to_max_trials(
+        self,
+        mock_optimization_context,
+        monkeypatch,
+        simple_chat_prompt,
+        mock_dataset,
+        sample_dataset_items,
+        sample_metric,
+    ) -> None:
+        """This unit covers the fallback LABELING only: gepa.optimize is mocked
+        (its internal MaxMetricCallsStopper never runs), so the test asserts
+        that a gepa exit with neither wired stopper fired is labeled
+        'max_trials' — never 'completed' (OPIK-7511). The claim that budget
+        exhaustion is the only remaining exit path is a property of the gepa
+        engine (it only ever exits via stop conditions); a real budget-driven
+        exit is exercised end-to-end by the imperfect-baseline e2e run."""
+        gepa_result = _make_mock_gepa_result(
+            candidates=[], val_aggregate_scores=[0.3, 0.5]
+        )
+        result, _ = _run_optimize(
+            monkeypatch,
+            mock_optimization_context,
+            simple_chat_prompt,
+            mock_dataset,
+            sample_dataset_items,
+            sample_metric,
+            gepa_result=gepa_result,
+        )
+
+        assert result.details["finish_reason"] == "max_trials"
+        assert result.details["stop_reason"] == "max_trials"
+
+    def test_finish_reason__no_improvement_stall__reports_no_improvement(
+        self,
+        mock_optimization_context,
+        monkeypatch,
+        simple_chat_prompt,
+        mock_dataset,
+        sample_dataset_items,
+        sample_metric,
+    ) -> None:
+        """When the wired NoImprovementStopper trips, the run must report
+        'no_improvement', not a budget burn."""
+
+        def stall_the_stopper(kwargs: dict[str, Any]) -> None:
+            # Drive the wired stopper the way the gepa engine would: one call
+            # per iteration with a stagnant full-eval score until it trips.
+            # Bounded so a stopper regression fails this test instead of
+            # hanging the whole suite.
+            stopper = next(
+                s
+                for s in kwargs["stop_callbacks"]
+                if isinstance(s, NoImprovementStopper)
+            )
+            state = SimpleNamespace(program_full_scores_val_set=[0.5])
+            limit = stopper.max_iterations_without_improvement + 2
+            tripped = any(stopper(state) for _ in range(limit))
+            assert tripped, (
+                f"NoImprovementStopper did not trip within {limit} stagnant iterations"
+            )
+
+        gepa_result = _make_mock_gepa_result(candidates=[], val_aggregate_scores=[0.5])
+        result, _ = _run_optimize(
+            monkeypatch,
+            mock_optimization_context,
+            simple_chat_prompt,
+            mock_dataset,
+            sample_dataset_items,
+            sample_metric,
+            gepa_result=gepa_result,
+            on_gepa_optimize=stall_the_stopper,
+            no_improvement_iterations=3,
+        )
+
+        assert result.details["finish_reason"] == "no_improvement"
+
 
 class TestStopperSemantics:
     """Guard the apples-to-apples property: stoppers read full-eval scores only."""
@@ -316,6 +400,42 @@ class TestCoercePositiveInt:
             _coerce_positive_int(float("nan"), default=7, allow_zero=True, name="n")
             == 7
         )
+
+
+class TestReflectionMinibatchBudgetWarning:
+    """The warning must state the REAL cost model: a large mini-batch doesn't
+    stop reflection, it exhausts the metric budget in few iterations."""
+
+    def test_budget_warning__too_few_iterations_fit__logs_real_iteration_count(
+        self, caplog
+    ) -> None:
+        # 400 // (2 * 50) = 4 iterations — below the expected minimum of 5.
+        with caplog.at_level(logging.WARNING, logger=_GEPA_OPTIMIZER_LOGGER):
+            _warn_if_reflection_minibatch_exhausts_budget(
+                reflection_minibatch_size=50,
+                max_metric_calls=400,
+            )
+        assert "allows only ~4 iteration(s)" in caplog.text
+        assert "~100 metric calls per reflection iteration" in caplog.text
+
+    def test_budget_warning__ample_budget__stays_silent(self, caplog) -> None:
+        # 400 // (2 * 5) = 40 iterations — plenty; must not cry wolf.
+        with caplog.at_level(logging.WARNING, logger=_GEPA_OPTIMIZER_LOGGER):
+            _warn_if_reflection_minibatch_exhausts_budget(
+                reflection_minibatch_size=5,
+                max_metric_calls=400,
+            )
+        assert caplog.text == ""
+
+    def test_budget_warning__exactly_min_iterations__stays_silent(self, caplog) -> None:
+        # 400 // (2 * 40) = 5 == MIN_EXPECTED_REFLECTION_ITERATIONS.
+        assert MIN_EXPECTED_REFLECTION_ITERATIONS == 5
+        with caplog.at_level(logging.WARNING, logger=_GEPA_OPTIMIZER_LOGGER):
+            _warn_if_reflection_minibatch_exhausts_budget(
+                reflection_minibatch_size=40,
+                max_metric_calls=400,
+            )
+        assert caplog.text == ""
 
 
 class TestBuildGepaStopCallbacks:

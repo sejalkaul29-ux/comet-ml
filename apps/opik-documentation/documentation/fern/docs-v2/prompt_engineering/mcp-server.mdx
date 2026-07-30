@@ -341,6 +341,20 @@ available on Comet Cloud only — on self-hosted those calls fail at dispatch;
 use `read` / `list` / `write` directly.
 </Tip>
 
+## Skills for coding agents
+
+Beyond the tools, Opik ships **agent skills** that teach a coding agent _how_ to
+use Opik — add tracing, evaluate, debug — installable in one command and usable
+with or without this MCP. Install them the standard way:
+
+```bash
+npx skills add comet-ml/opik-skills
+```
+
+See **[Agent Skills](/agent-skills)** for the full list and usage. If your agent
+is connected to this MCP, it can also pull skills on demand via `read_skill` —
+nothing to install.
+
 ## Using the MCP server
 
 ### The tools at a glance

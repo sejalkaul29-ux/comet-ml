@@ -31,6 +31,7 @@ import uk.co.jemos.podam.api.PodamFactoryImpl;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -290,6 +291,35 @@ class TraceServiceImplTest {
 
             verify(traceDao).delete(ids, projectId, connection);
             verifyNoInteractions(deletionEventDAO, eventBus);
+        }
+
+        @Test
+        void deleteWithoutProjectIdFallsBackToUnboundedForBoundedMisses() {
+            var resolvedId = idGenerator.generateId();
+            var missedId = idGenerator.generateId();
+            var projectA = idGenerator.generateId();
+            var projectB = idGenerator.generateId();
+            var workspaceId = UUID.randomUUID().toString();
+            var ids = Set.of(resolvedId, missedId);
+            var connection = mockDeleteFlow();
+
+            // Bounded window resolves only resolvedId; missedId (e.g. a wrapped id_at) is re-resolved unbounded.
+            when(traceDao.getAllProjectIdsByTraceIdsBounded(ids))
+                    .thenReturn(Mono.just(Map.of(resolvedId, Set.of(projectA))));
+            when(traceDao.getAllProjectIdsByTraceIds(Set.of(missedId)))
+                    .thenReturn(Mono.just(Map.of(missedId, Set.of(projectB))));
+            when(traceDao.delete(Set.of(resolvedId), projectA, connection)).thenReturn(Mono.empty());
+            when(traceDao.delete(Set.of(missedId), projectB, connection)).thenReturn(Mono.empty());
+
+            assertDoesNotThrow(() -> traceService
+                    .delete(ids, null)
+                    .contextWrite(ctx -> ctx.put(RequestContext.USER_NAME, DEFAULT_USER)
+                            .put(RequestContext.WORKSPACE_ID, workspaceId))
+                    .block());
+
+            verify(traceDao).getAllProjectIdsByTraceIds(Set.of(missedId));
+            verify(traceDao).delete(Set.of(resolvedId), projectA, connection);
+            verify(traceDao).delete(Set.of(missedId), projectB, connection);
         }
 
         private Connection mockDeleteFlow() {

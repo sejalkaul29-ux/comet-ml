@@ -1,8 +1,10 @@
 package com.comet.opik.domain;
 
+import com.comet.opik.api.ExperimentItem;
 import com.comet.opik.api.OptimizationStatus;
 import com.comet.opik.api.OptimizationStudioConfig;
 import com.comet.opik.api.OptimizationUpdate;
+import com.comet.opik.api.Trace;
 import com.comet.opik.api.resources.utils.ClickHouseContainerUtils;
 import com.comet.opik.api.resources.utils.ClientSupportUtils;
 import com.comet.opik.api.resources.utils.MigrationUtils;
@@ -12,10 +14,13 @@ import com.comet.opik.api.resources.utils.RedisContainerUtils;
 import com.comet.opik.api.resources.utils.TestDropwizardAppExtensionUtils;
 import com.comet.opik.api.resources.utils.TestUtils;
 import com.comet.opik.api.resources.utils.WireMockUtils;
+import com.comet.opik.api.resources.utils.resources.ExperimentResourceClient;
 import com.comet.opik.api.resources.utils.resources.OptimizationResourceClient;
+import com.comet.opik.api.resources.utils.resources.TraceResourceClient;
 import com.comet.opik.api.resources.v1.jobs.OptimizationStalledReaperJob;
 import com.comet.opik.extensions.DropwizardAppExtensionProvider;
 import com.comet.opik.extensions.RegisterApp;
+import com.comet.opik.infrastructure.auth.RequestContext;
 import com.comet.opik.podam.PodamFactoryUtils;
 import com.google.common.eventbus.EventBus;
 import com.google.inject.Injector;
@@ -38,7 +43,12 @@ import ru.vyarus.dropwizard.guice.test.ClientSupport;
 import ru.vyarus.dropwizard.guice.test.jupiter.ext.TestDropwizardAppExtension;
 import uk.co.jemos.podam.api.PodamFactory;
 
+import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -80,6 +90,11 @@ class OptimizationStalledReaperServiceTest {
     private static final String WORKSPACE_ID = UUID.randomUUID().toString();
     private static final String TEST_WORKSPACE_NAME = "workspace" + RandomStringUtils.secure().nextAlphanumeric(36);
     private static final String USER = "user-" + RandomStringUtils.secure().nextAlphanumeric(36);
+
+    // A second, unrelated workspace — cross-workspace isolation coverage for the liveness probe.
+    private static final String OTHER_API_KEY = UUID.randomUUID().toString();
+    private static final String OTHER_WORKSPACE_ID = UUID.randomUUID().toString();
+    private static final String OTHER_WORKSPACE_NAME = "workspace" + RandomStringUtils.secure().nextAlphanumeric(36);
 
     private final RedisContainer REDIS = RedisContainerUtils.newRedisContainer();
     private final MySQLContainer MYSQL_CONTAINER = MySQLContainerUtils.newMySQLContainer();
@@ -123,6 +138,8 @@ class OptimizationStalledReaperServiceTest {
     private final PodamFactory podamFactory = PodamFactoryUtils.newPodamFactory();
 
     private OptimizationResourceClient optimizationResourceClient;
+    private ExperimentResourceClient experimentResourceClient;
+    private TraceResourceClient traceResourceClient;
     private OptimizationService optimizationService;
     private Injector injector;
 
@@ -132,10 +149,13 @@ class OptimizationStalledReaperServiceTest {
         ClientSupportUtils.config(client);
 
         this.optimizationResourceClient = new OptimizationResourceClient(client, baseURI, podamFactory);
+        this.experimentResourceClient = new ExperimentResourceClient(client, baseURI, podamFactory);
+        this.traceResourceClient = new TraceResourceClient(client, baseURI);
         this.optimizationService = optimizationService;
         this.injector = injector;
 
         mockTargetWorkspace(wireMock.server(), API_KEY, TEST_WORKSPACE_NAME, WORKSPACE_ID, USER);
+        mockTargetWorkspace(wireMock.server(), OTHER_API_KEY, OTHER_WORKSPACE_NAME, OTHER_WORKSPACE_ID, USER);
     }
 
     @Test
@@ -216,6 +236,142 @@ class OptimizationStalledReaperServiceTest {
     }
 
     @Test
+    @DisplayName("keeps a running run alive on recent trial progress despite a stale row timestamp")
+    void keepsRunningRunWithRecentTrialProgress() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        createTrialExperiment(id);
+
+        // The row timestamp (1h old) is far past the 5-minute running timeout, but the trial experiment
+        // created just above is within it — progress-based liveness keeps the run alive (OPIK-7459).
+        reconcile(NEVER, Duration.ofMinutes(5), BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.RUNNING);
+    }
+
+    @Test
+    @DisplayName("reaps a running run whose latest trial is itself older than the timeout")
+    void reapsRunningRunWhoseTrialProgressIsStale() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        createTrialExperiment(id);
+
+        // With a zero timeout even the just-created trial experiment already falls outside the window,
+        // so a trial that stopped being followed by new ones cannot keep the run alive indefinitely.
+        reconcile(NEVER, IMMEDIATE, BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
+    @DisplayName("reaps a stale running run that never produced a trial")
+    void reapsBackdatedRunningRunWithoutTrials() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+
+        // Same 5-minute timeout as the keeps-alive case above: the only difference is the absence of a
+        // trial experiment, proving the anti-join is what decides.
+        reconcile(NEVER, Duration.ofMinutes(5), BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
+    @DisplayName("keeps a running run alive on item-level progress within a long trial")
+    void keepsRunningRunAliveOnItemProgressWithinLongTrial() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+
+        // The shape of a long single trial: the trial experiment row is old (backdated an hour, far past
+        // the 5-minute window), but items keep arriving as dataset items are evaluated. Only the
+        // item-level branch of the liveness probe can keep this run alive.
+        var experimentId = createBackdatedTrialExperiment(id, Duration.ofHours(1));
+        createExperimentItem(experimentId);
+
+        reconcile(NEVER, Duration.ofMinutes(5), BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.RUNNING);
+    }
+
+    @Test
+    @DisplayName("reaps a stale running run even when other runs have recent trials")
+    void reapsStaleRunDespiteOtherRunsProgress() {
+        var staleId = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        var healthyId = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        createTrialExperiment(healthyId);
+        // A regular (non-studio) experiment with no optimization_id must not register as anyone's progress.
+        experimentResourceClient.create(experimentResourceClient.createPartialExperiment().build(),
+                API_KEY, TEST_WORKSPACE_NAME);
+
+        // The anti-join must correlate progress per run: the healthy run's fresh trial saves only itself.
+        reconcile(NEVER, Duration.ofMinutes(5), BATCH_SIZE);
+
+        assertThat(statusOf(staleId)).isEqualTo(OptimizationStatus.ERROR);
+        assertThat(statusOf(healthyId)).isEqualTo(OptimizationStatus.RUNNING);
+    }
+
+    @Test
+    @DisplayName("reaps a stale run whose id is referenced by another workspace's experiment")
+    void reapsStaleRunDespiteForeignWorkspaceExperiment() {
+        var staleId = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        // optimization_id is stored without an existence check (see ExperimentService), so a client in
+        // another workspace can write an experiment carrying this run's UUID. The liveness probe matches
+        // (id, workspace_id) tuples, so foreign-workspace activity must never register as this run's
+        // progress and keep a dead run spinning.
+        experimentResourceClient.create(experimentResourceClient.createPartialExperiment()
+                .optimizationId(staleId)
+                .build(), OTHER_API_KEY, OTHER_WORKSPACE_NAME);
+
+        reconcile(NEVER, Duration.ofMinutes(5), BATCH_SIZE);
+
+        assertThat(statusOf(staleId)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
+    @DisplayName("reaps a stale INITIALIZED run regardless of trial rows (progress liveness is RUNNING-only)")
+    void reapsStaleInitializedRunDespiteTrialRows() {
+        // Backdated INITIALIZED seed: single upsert, the create path forces INITIALIZED anyway.
+        var optimization = optimizationResourceClient.createPartialOptimization()
+                .studioConfig(studioConfig())
+                .lastUpdatedAt(Instant.now().minus(Duration.ofHours(1)))
+                .build();
+        var id = optimizationResourceClient.upsert(optimization, API_KEY, TEST_WORKSPACE_NAME);
+        createTrialExperiment(id);
+
+        // An INITIALIZED run with experiment rows is an inconsistent state; the worker still never called
+        // mark_running, so the initialized branch must reap it without consulting the progress signal.
+        reconcile(Duration.ofMinutes(5), NEVER, BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
+    @DisplayName("reaps a stale run whose unfinished-trace items break the heavyweight GET query")
+    void reapsStaleRunDespiteUnmappableGetById() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(1));
+        var experimentId = createTrialExperiment(id);
+        // An item referencing a still-unfinished trace is exactly what a worker killed mid-trial leaves
+        // behind — it used to make the full GET/FIND query drop the run (fixed by FIND's NaN guards; see
+        // OptimizationsResourceTest). The reaper's re-read must stay off that query regardless, so a
+        // future FIND regression can never make it skip such a run on every cycle and resurrect the
+        // eternal spinner.
+        createExperimentItem(experimentId, false);
+
+        reconcile(NEVER, IMMEDIATE, BATCH_SIZE);
+
+        assertThat(statusSnapshotOf(id)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
+    @DisplayName("reaps a running run past the hard ceiling despite fresh trial progress")
+    void reapsRunningRunPastHardCapDespiteProgress() {
+        var id = seedBackdatedRunningStudioRun(Duration.ofHours(2));
+        createTrialExperiment(id);
+
+        // The just-created trial keeps the run alive for the progress check (5m), but the row is 2h past
+        // its last status change and the hard ceiling is 1h — the zombie-worker backstop must win.
+        reconcile(NEVER, Duration.ofMinutes(5), Duration.ofHours(1), BATCH_SIZE);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.ERROR);
+    }
+
+    @Test
     @DisplayName("respects the batch size limit per cycle")
     void respectsBatchSizeLimit() {
         seedStudioRun(OptimizationStatus.INITIALIZED);
@@ -229,8 +385,14 @@ class OptimizationStalledReaperServiceTest {
     }
 
     private long reconcile(Duration initializedTimeout, Duration runningTimeout, int batchSize) {
+        return reconcile(initializedTimeout, runningTimeout, NEVER, batchSize);
+    }
+
+    private long reconcile(Duration initializedTimeout, Duration runningTimeout, Duration runningHardTimeout,
+            int batchSize) {
         Long transitioned = optimizationService
-                .reconcileStalledStudioOptimizations(initializedTimeout, runningTimeout, LOOKBACK_MARGIN, batchSize)
+                .reconcileStalledStudioOptimizations(initializedTimeout, runningTimeout, runningHardTimeout,
+                        LOOKBACK_MARGIN, batchSize)
                 .block();
         assertThat(transitioned).isNotNull();
         return transitioned;
@@ -266,6 +428,111 @@ class OptimizationStalledReaperServiceTest {
     private void transition(UUID id, OptimizationStatus status) {
         optimizationResourceClient.update(id, OptimizationUpdate.builder().status(status).build(),
                 API_KEY, TEST_WORKSPACE_NAME, 204);
+    }
+
+    /**
+     * Seeds a RUNNING studio run whose latest row version's {@code last_updated_at} is backdated by
+     * {@code age}, so the row timestamp alone reads as stale. The update endpoint always stamps
+     * {@code now} and the create path forces INITIALIZED for new studio runs, so neither can produce
+     * this state — instead the run is upserted twice with the same id: the create (backdated a minute
+     * further, forced INITIALIZED) and a RUNNING re-upsert whose backdated timestamp stays the newest
+     * version for the reaper's {@code argMax} dedup.
+     */
+    private UUID seedBackdatedRunningStudioRun(Duration age) {
+        var optimization = optimizationResourceClient.createPartialOptimization()
+                .studioConfig(studioConfig())
+                .lastUpdatedAt(Instant.now().minus(age).minus(Duration.ofMinutes(1)))
+                .build();
+        var id = optimizationResourceClient.upsert(optimization, API_KEY, TEST_WORKSPACE_NAME);
+        optimizationResourceClient.upsert(optimization.toBuilder()
+                .id(id)
+                .status(OptimizationStatus.RUNNING)
+                .lastUpdatedAt(Instant.now().minus(age))
+                .build(), API_KEY, TEST_WORKSPACE_NAME);
+
+        assertThat(statusOf(id)).isEqualTo(OptimizationStatus.RUNNING);
+        return id;
+    }
+
+    /** Creates a trial experiment linked to the run — the progress signal the reaper's liveness reads. */
+    private UUID createTrialExperiment(UUID optimizationId) {
+        var experiment = experimentResourceClient.createPartialExperiment()
+                .optimizationId(optimizationId)
+                .build();
+        return experimentResourceClient.create(experiment, API_KEY, TEST_WORKSPACE_NAME);
+    }
+
+    /**
+     * Inserts a trial experiment row straight into ClickHouse with a backdated {@code created_at}. The
+     * API always stamps {@code created_at} server-side, and the reaper probe reads {@code experiments}
+     * without FINAL — so a second, backdated version of an API-created row would not hide the fresh
+     * one. A single raw row is the only way to seed an "old trial" deterministically, without
+     * {@code Thread.sleep}-ing the suite past the reaper window.
+     */
+    private UUID createBackdatedTrialExperiment(UUID optimizationId, Duration age) {
+        var experiment = experimentResourceClient.createPartialExperiment()
+                .optimizationId(optimizationId)
+                .build();
+        var createdAt = LocalDateTime.ofInstant(Instant.now().minus(age), ZoneOffset.UTC);
+        try (var connection = CLICK_HOUSE_CONTAINER.createConnection("");
+                var statement = connection.prepareStatement(
+                        ("INSERT INTO %s.experiments (workspace_id, dataset_id, id, name, optimization_id, "
+                                + "created_at, last_updated_at, created_by, last_updated_by) "
+                                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").formatted(DATABASE_NAME))) {
+            statement.setString(1, WORKSPACE_ID);
+            statement.setString(2, experiment.datasetId().toString());
+            statement.setString(3, experiment.id().toString());
+            statement.setString(4, experiment.name());
+            statement.setString(5, optimizationId.toString());
+            statement.setObject(6, createdAt);
+            statement.setObject(7, createdAt);
+            statement.setString(8, USER);
+            statement.setString(9, USER);
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to seed backdated trial experiment", e);
+        }
+        return experiment.id();
+    }
+
+    /**
+     * Appends one experiment item to a trial — the per-dataset-item progress signal within a trial. The
+     * item's trace is created for real first, matching the worker, which always logs the trace before
+     * the item.
+     */
+    private void createExperimentItem(UUID experimentId) {
+        createExperimentItem(experimentId, true);
+    }
+
+    private void createExperimentItem(UUID experimentId, boolean traceFinished) {
+        var traceBuilder = podamFactory.manufacturePojo(Trace.class).toBuilder()
+                .feedbackScores(null)
+                .usage(null);
+        if (!traceFinished) {
+            traceBuilder.endTime(null).duration(null);
+        }
+        var traceId = traceResourceClient.createTrace(traceBuilder.build(), API_KEY, TEST_WORKSPACE_NAME);
+        var item = podamFactory.manufacturePojo(ExperimentItem.class).toBuilder()
+                .experimentId(experimentId)
+                .traceId(traceId)
+                .feedbackScores(null)
+                .build();
+        experimentResourceClient.createExperimentItem(Set.of(item), API_KEY, TEST_WORKSPACE_NAME);
+    }
+
+    /**
+     * The bare status re-read the reaper itself uses. reapsStaleRunDespiteUnmappableGetById asserts
+     * through it to prove the reaper path works independently of the heavyweight GET/FIND mapping.
+     */
+    private OptimizationStatus statusSnapshotOf(UUID id) {
+        var snapshot = injector.getInstance(OptimizationDAO.class)
+                .getStatusSnapshotById(id)
+                .contextWrite(ctx -> ctx
+                        .put(RequestContext.WORKSPACE_ID, WORKSPACE_ID)
+                        .put(RequestContext.USER_NAME, USER))
+                .block();
+        assertThat(snapshot).isNotNull();
+        return snapshot.status();
     }
 
     private OptimizationStudioConfig studioConfig() {
